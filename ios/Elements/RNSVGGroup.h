@@ -12,16 +12,16 @@
 #import "RNSVGCGFCRule.h"
 #import "RNSVGSvgView.h"
 #import "RNSVGPath.h"
-#import "GlyphContext.h"
+#import "RNSVGGlyphContext.h"
 
 @interface RNSVGGroup : RNSVGPath <RNSVGContainer>
 
 @property (nonatomic, strong) NSDictionary *font;
 
-- (void)renderPathTo:(CGContextRef)context;
-- (void)renderGroupTo:(CGContextRef)context;
+- (void)renderPathTo:(CGContextRef)context rect:(CGRect)rect;
+- (void)renderGroupTo:(CGContextRef)context rect:(CGRect)rect;
 
-- (GlyphContext *)getGlyphContext;
+- (RNSVGGlyphContext *)getGlyphContext;
 - (void)pushGlyphContext;
 - (void)popGlyphContext;
 @end

@@ -8,68 +8,212 @@
 #import "RNSVGTSpan.h"
 #import "RNSVGText.h"
 #import "RNSVGTextPath.h"
-#import "FontData.h"
+#import "RNSVGTextProperties.h"
+#import "RNSVGFontData.h"
 
-NSCharacterSet *separators = nil;
-static double radToDeg = 180 / M_PI;
+static NSCharacterSet *RNSVGTSpan_separators = nil;
+static CGFloat RNSVGTSpan_radToDeg = 180 / (CGFloat)M_PI;
+
+@interface TopAlignedLabel : UILabel
+
+@end
+
+
+@implementation TopAlignedLabel
+
+- (void)drawTextInRect:(CGRect) rect
+{
+    NSAttributedString *attributedText = [[NSAttributedString alloc]     initWithString:self.text attributes:@{NSFontAttributeName:self.font}];
+    rect.size.height = [attributedText boundingRectWithSize:rect.size
+                                                    options:NSStringDrawingUsesLineFragmentOrigin
+                                                    context:nil].size.height;
+    if (self.numberOfLines != 0) {
+        rect.size.height = MIN(rect.size.height, self.numberOfLines * self.font.lineHeight);
+    }
+    [super drawTextInRect:rect];
+}
+
+@end
 
 @implementation RNSVGTSpan
 {
     CGFloat startOffset;
-    CGPathRef _cache;
     CGFloat _pathLength;
     RNSVGTextPath *textPath;
     NSArray *lengths;
     NSArray *lines;
     NSUInteger lineCount;
     BOOL isClosed;
+    NSMutableArray *emoji;
+    NSMutableArray *emojiTransform;
+    CGFloat cachedAdvance;
+    CTFontRef fontRef;
+    CGFloat firstX;
+    CGFloat firstY;
 }
 
 - (id)init
 {
     self = [super init];
 
-    if (separators == nil) {
-        separators = [NSCharacterSet whitespaceCharacterSet];
+    if (RNSVGTSpan_separators == nil) {
+        RNSVGTSpan_separators = [NSCharacterSet whitespaceCharacterSet];
     }
+
+    emoji = [NSMutableArray arrayWithCapacity:0];
+    emojiTransform = [NSMutableArray arrayWithCapacity:0];
 
     return self;
 }
 
+- (void)clearPath
+{
+    [super clearPath];
+    cachedAdvance = NAN;
+}
+
 - (void)setContent:(NSString *)content
 {
-    if (content == _content) {
+    if ([content isEqualToString:_content]) {
         return;
     }
     [self invalidate];
     _content = content;
 }
 
-- (void)renderLayerTo:(CGContextRef)context
+- (void)renderLayerTo:(CGContextRef)context rect:(CGRect)rect
 {
     if (self.content) {
-        [self renderPathTo:context];
+        RNSVGGlyphContext* gc = [self.textRoot getGlyphContext];
+        if (self.inlineSize != nil && self.inlineSize.value != 0) {
+            [self drawWrappedText:context gc:gc rect:rect];
+        } else {
+            if (self.path) {
+                NSUInteger count = [emoji count];
+                CGFloat fontSize = [gc getFontSize];
+                for (NSUInteger i = 0; i < count; i++) {
+                    UILabel *label = [emoji objectAtIndex:i];
+                    NSValue *transformValue = [emojiTransform objectAtIndex:i];
+                    CGAffineTransform transform = [transformValue CGAffineTransformValue];
+                    CGContextConcatCTM(context, transform);
+                    CGContextTranslateCTM(context, 0, -fontSize);
+                    [label.layer renderInContext:context];
+                    CGContextTranslateCTM(context, 0, fontSize);
+                    CGContextConcatCTM(context, CGAffineTransformInvert(transform));
+                }
+            }
+            [self renderPathTo:context rect:rect];
+        }
     } else {
         [self clip:context];
-        [self renderGroupTo:context];
+        [self renderGroupTo:context rect:rect];
     }
 }
 
-- (void)releaseCachedPath
-{
-    CGPathRelease(_cache);
-    _cache = nil;
+- (NSMutableDictionary *)getAttributes:(RNSVGFontData *)fontdata {
+    NSMutableDictionary *attrs = [[NSMutableDictionary alloc] init];
+
+    if (fontRef != nil) {
+        attrs[NSFontAttributeName] = (__bridge id)fontRef;
+    }
+
+    CGFloat letterSpacing = fontdata->letterSpacing;
+    bool allowOptionalLigatures = letterSpacing == 0 && fontdata->fontVariantLigatures == RNSVGFontVariantLigaturesNormal;
+    NSNumber *lig = [NSNumber numberWithInt:allowOptionalLigatures ? 2 : 1];
+    attrs[NSLigatureAttributeName] = lig;
+
+    CGFloat kerning = fontdata->kerning;
+    float kern = (float)(letterSpacing + kerning);
+    NSNumber *kernAttr = [NSNumber numberWithFloat:kern];
+#if DTCORETEXT_SUPPORT_NS_ATTRIBUTES
+    if (___useiOS6Attributes)
+    {
+        [attrs setObject:kernAttr forKey:NSKernAttributeName];
+    }
+    else
+#endif
+    {
+        [attrs setObject:kernAttr forKey:(id)kCTKernAttributeName];
+    }
+
+    return attrs;
 }
 
-- (void)dealloc
-{
-    CGPathRelease(_cache);
+TopAlignedLabel *label;
+- (void)drawWrappedText:(CGContextRef)context gc:(RNSVGGlyphContext *)gc rect:(CGRect)rect {
+    [self pushGlyphContext];
+    fontRef = [self getFontFromContext];
+    RNSVGFontData* fontdata = [gc getFont];
+    CFStringRef string = (__bridge CFStringRef)self.content;
+    NSMutableDictionary * attrs = [self getAttributes:fontdata];
+    CFMutableDictionaryRef attributes = (__bridge CFMutableDictionaryRef)attrs;
+    CFAttributedStringRef attrString = CFAttributedStringCreate(kCFAllocatorDefault, string, attributes);
+
+    enum RNSVGTextAnchor textAnchor = fontdata->textAnchor;
+    NSTextAlignment align;
+    switch (textAnchor) {
+        case RNSVGTextAnchorStart:
+            align = NSTextAlignmentLeft;
+            break;
+
+        case RNSVGTextAnchorMiddle:
+            align = NSTextAlignmentCenter;
+            break;
+
+        case RNSVGTextAnchorEnd:
+            align = NSTextAlignmentRight;
+            break;
+
+        default:
+            align = NSTextAlignmentLeft;
+            break;
+    }
+
+    UIFont *font = (__bridge UIFont *)(fontRef);
+    if (!label) {
+        label = [[TopAlignedLabel alloc] init];
+    }
+    label.attributedText = (__bridge NSAttributedString * _Nullable)(attrString);
+    label.baselineAdjustment = UIBaselineAdjustmentNone;
+    label.lineBreakMode = NSLineBreakByWordWrapping;
+    label.backgroundColor = UIColor.clearColor;
+    label.textAlignment = align;
+    label.numberOfLines = 0;
+    label.opaque = NO;
+    label.font = font;
+
+    CGFloat fontSize = [gc getFontSize];
+    CGFloat height = CGRectGetHeight(rect);
+    CGFloat width = [RNSVGPropHelper fromRelative:self.inlineSize
+                                         relative:[gc getWidth]
+                                         fontSize:fontSize];
+    CGRect constrain = CGRectMake(0, 0, width, height);
+    CGRect s = [self.content
+                boundingRectWithSize:constrain.size
+                options:NSStringDrawingUsesLineFragmentOrigin
+                attributes:attrs
+                context:nil];
+
+    CGRect bounds = CGRectMake(0, 0, width, s.size.height);
+    label.frame = bounds;
+    label.bounds = bounds;
+
+    firstX = [gc nextXWithDouble:0];
+    firstY = [gc nextY] - font.ascender;
+    CGFloat dx = firstX;
+    CGFloat dy = firstY;
+    CGContextTranslateCTM(context, dx, dy);
+    [label.layer renderInContext:context];
+    CGContextTranslateCTM(context, -dx, -dy);
+    [self popGlyphContext];
+    [self renderPathTo:context rect:rect];
 }
 
 - (CGPathRef)getPath:(CGContextRef)context
 {
-    if (_cache) {
-        return _cache;
+    CGPathRef path = self.path;
+    if (path) {
+        return path;
     }
 
     NSString *text = self.content;
@@ -77,26 +221,70 @@ static double radToDeg = 180 / M_PI;
         return [self getGroupPath:context];
     }
 
+    if (self.inlineSize != nil && self.inlineSize.value != 0) {
+        CGAffineTransform transform = CGAffineTransformMakeTranslation(firstX, firstY);
+        path = CGPathCreateWithRect(label.bounds, &transform);
+        self.path = CGPathRetain(path);
+        self.skip = true;
+        return path;
+    }
+
     [self setupTextPath:context];
 
     [self pushGlyphContext];
 
-    CGMutablePathRef path = [self getLinePath:text];
+    path = [self getLinePath:text context:context];
 
-    _cache = CGPathRetain(CFAutorelease(CGPathCreateCopy(path)));
+    self.path = CGPathRetain(path);
 
     [self popGlyphContext];
 
-    return (CGPathRef)CFAutorelease(path);
+    return path;
 }
 
-- (CGMutablePathRef)getLinePath:(NSString *)str
+- (CGFloat)getSubtreeTextChunksTotalAdvance
+{
+    if (!isnan(cachedAdvance)) {
+        return cachedAdvance;
+    }
+    CGFloat advance = 0;
+
+    NSString *str = self.content;
+    if (!str) {
+        for (UIView *node in self.subviews) {
+            if ([node isKindOfClass:[RNSVGText class]]) {
+                RNSVGText *text = (RNSVGText*)node;
+                advance += [text getSubtreeTextChunksTotalAdvance];
+            }
+        }
+        cachedAdvance = advance;
+        return advance;
+    }
+
+    // Create a dictionary for this font
+    fontRef = [self getFontFromContext];
+    RNSVGGlyphContext *gc = [self.textRoot getGlyphContext];
+    RNSVGFontData *fontdata = [gc getFont];
+    NSMutableDictionary *attrs = [self getAttributes:fontdata];
+
+    CFStringRef string = (__bridge CFStringRef)str;
+    CFMutableDictionaryRef attributes = (__bridge CFMutableDictionaryRef)attrs;
+    CFAttributedStringRef attrString = CFAttributedStringCreate(kCFAllocatorDefault, string, attributes);
+    CTLineRef line = CTLineCreateWithAttributedString(attrString);
+
+    CGRect textBounds = CTLineGetBoundsWithOptions(line, 0);
+    CGFloat textMeasure = CGRectGetWidth(textBounds);
+    cachedAdvance = textMeasure;
+    return textMeasure;
+}
+
+- (CGPathRef)getLinePath:(NSString *)str context:(CGContextRef)context
 {
     // Create a dictionary for this font
-    CTFontRef fontRef = [self getFontFromContext];
+    fontRef = [self getFontFromContext];
     CGMutablePathRef path = CGPathCreateMutable();
-    GlyphContext* gc = [[self getTextRoot] getGlyphContext];
-    FontData* font = [gc getFont];
+    RNSVGGlyphContext *gc = [self.textRoot getGlyphContext];
+    RNSVGFontData *font = [gc getFont];
     NSUInteger n = str.length;
     /*
      *
@@ -117,9 +305,9 @@ static double radToDeg = 180 / M_PI;
      *  or decrease the space between typographic character units in order to justify text.
      *
      * */
-    double kerning = font->kerning;
-    double wordSpacing = font->wordSpacing;
-    double letterSpacing = font->letterSpacing;
+    CGFloat kerning = font->kerning;
+    CGFloat wordSpacing = font->wordSpacing;
+    CGFloat letterSpacing = font->letterSpacing;
     bool autoKerning = !font->manualKerning;
 
     /*
@@ -169,7 +357,7 @@ static double radToDeg = 180 / M_PI;
      user agents should not apply optional ligatures.
      https://www.w3.org/TR/css-text-3/#letter-spacing-property
      */
-    bool allowOptionalLigatures = letterSpacing == 0 && font->fontVariantLigatures == FontVariantLigaturesNormal;
+    bool allowOptionalLigatures = letterSpacing == 0 && font->fontVariantLigatures == RNSVGFontVariantLigaturesNormal;
 
     /*
      For OpenType fonts, discretionary ligatures include those enabled by
@@ -229,16 +417,27 @@ static double radToDeg = 180 / M_PI;
      */
     // OpenType.js font data
     NSDictionary * fontData = font->fontData;
+    NSMutableDictionary *attrs = [[NSMutableDictionary alloc] init];
+    CFMutableDictionaryRef attributes = (__bridge CFMutableDictionaryRef)attrs;
 
     NSNumber *lig = [NSNumber numberWithInt:allowOptionalLigatures ? 2 : 1];
-    CFDictionaryRef attributes;
+    attrs[NSLigatureAttributeName] = lig;
     if (fontRef != nil) {
-        attributes = (__bridge CFDictionaryRef)@{
-                                                 (NSString *)kCTFontAttributeName: (__bridge id)fontRef,
-                                                 (NSString *)NSLigatureAttributeName: lig                                                };
-    } else {
-        attributes = (__bridge CFDictionaryRef)@{
-                                                 (NSString *)NSLigatureAttributeName: lig                                                            };
+        attrs[NSFontAttributeName] = (__bridge id)fontRef;
+    }
+    if (!autoKerning) {
+        NSNumber *noAutoKern = [NSNumber numberWithFloat:0.0f];
+
+#if DTCORETEXT_SUPPORT_NS_ATTRIBUTES
+        if (___useiOS6Attributes)
+        {
+            [attrs setObject:noAutoKern forKey:NSKernAttributeName];
+        }
+        else
+#endif
+        {
+            [attrs setObject:noAutoKern forKey:(id)kCTKernAttributeName];
+        }
     }
 
     CFStringRef string = (__bridge CFStringRef)str;
@@ -268,20 +467,20 @@ static double radToDeg = 180 / M_PI;
      is adjusted to take into account various horizontal alignment text properties and
      attributes, such as a ‘dx’ attribute value on a ‘tspan’ element.
      */
-    enum TextAnchor textAnchor = font->textAnchor;
-    CGRect textBounds = CTLineGetBoundsWithOptions(line, 0);
-    double textMeasure = CGRectGetWidth(textBounds);
-    double offset = getTextAnchorOffset(textAnchor, textMeasure);
+    enum RNSVGTextAnchor textAnchor = font->textAnchor;
+    RNSVGText *anchorRoot = [self getTextAnchorRoot];
+    CGFloat textMeasure = [anchorRoot getSubtreeTextChunksTotalAdvance];
+    CGFloat offset = [RNSVGTSpan getTextAnchorOffset:textAnchor width:textMeasure];
 
     bool hasTextPath = textPath != nil;
 
     int side = 1;
-    double startOfRendering = 0;
-    double endOfRendering = _pathLength;
-    double fontSize = [gc getFontSize];
-    bool sharpMidLine = false;
+    CGFloat startOfRendering = 0;
+    CGFloat endOfRendering = _pathLength;
+    CGFloat fontSize = [gc getFontSize];
+    //bool sharpMidLine = false;
     if (hasTextPath) {
-        sharpMidLine = TextPathMidLineFromString([textPath midLine]) == TextPathMidLineSharp;
+        //sharpMidLine = RNSVGTextPathMidLineFromString([textPath midLine]) == RNSVGTextPathMidLineSharp;
         /*
          Name
          side
@@ -302,7 +501,7 @@ static double radToDeg = 180 / M_PI;
 
          Adding 'side' was resolved at the Sydney (2015) meeting.
          */
-        side = TextPathSideFromString([textPath side]) == TextPathSideRight ? -1 : 1;
+        side = RNSVGTextPathSideFromString([textPath side]) == RNSVGTextPathSideRight ? -1 : 1;
         /*
          Name
          startOffset
@@ -341,20 +540,18 @@ static double radToDeg = 180 / M_PI;
          a point on the path equal distance in both directions from the initial position on
          the path is reached.
          */
-        double absoluteStartOffset = [PropHelper fromRelativeWithNSString:textPath.startOffset
-                                                                 relative:_pathLength
-                                                                   offset:0
-                                                                    scale:1
-                                                                 fontSize:fontSize];
+        CGFloat absoluteStartOffset = [RNSVGPropHelper fromRelative:textPath.startOffset
+                                                          relative:_pathLength
+                                                          fontSize:fontSize];
         offset += absoluteStartOffset;
         if (isClosed) {
-            double halfPathDistance = _pathLength / 2;
-            startOfRendering = absoluteStartOffset + (textAnchor == TextAnchorMiddle ? -halfPathDistance : 0);
+            CGFloat halfPathDistance = _pathLength / 2;
+            startOfRendering = absoluteStartOffset + (textAnchor == RNSVGTextAnchorMiddle ? -halfPathDistance : 0);
             endOfRendering = startOfRendering + _pathLength;
         }
         /*
-         TextPathSpacing spacing = textPath.getSpacing();
-         if (spacing == TextPathSpacing.auto) {
+         RNSVGTextPathSpacing spacing = textPath.getSpacing();
+         if (spacing == RNSVGTextPathSpacing.auto) {
          // Hmm, what to do here?
          // https://svgwg.org/svg2-draft/text.html#TextPathElementSpacingAttribute
          }
@@ -436,15 +633,13 @@ static double radToDeg = 180 / M_PI;
      the author's computation exactly matched the value calculated by the user agent;
      thus, no advance adjustments are made.
      */
-    double scaleSpacingAndGlyphs = 1;
-    NSString *mTextLength = [self textLength];
-    enum TextLengthAdjust mLengthAdjust = TextLengthAdjustFromString([self lengthAdjust]);
+    CGFloat scaleSpacingAndGlyphs = 1;
+    RNSVGLength *mTextLength = [self textLength];
+    enum RNSVGTextLengthAdjust mLengthAdjust = RNSVGTextLengthAdjustFromString([self lengthAdjust]);
     if (mTextLength != nil) {
-        double author = [PropHelper fromRelativeWithNSString:mTextLength
-                                                    relative:[gc getWidth]
-                                                      offset:0
-                                                       scale:1
-                                                    fontSize:fontSize];
+        CGFloat author = [RNSVGPropHelper fromRelative:mTextLength
+                                             relative:[gc getWidth]
+                                             fontSize:fontSize];
         if (author < 0) {
             NSException *e = [NSException
                               exceptionWithName:@"NegativeTextLength"
@@ -454,16 +649,16 @@ static double radToDeg = 180 / M_PI;
         }
         switch (mLengthAdjust) {
             default:
-            case TextLengthAdjustSpacing:
+            case RNSVGTextLengthAdjustSpacing:
                 // TODO account for ligatures
                 letterSpacing += (author - textMeasure) / (n - 1);
                 break;
-            case TextLengthAdjustSpacingAndGlyphs:
+            case RNSVGTextLengthAdjustSpacingAndGlyphs:
                 scaleSpacingAndGlyphs = author / textMeasure;
                 break;
         }
     }
-    double scaledDirection = scaleSpacingAndGlyphs * side;
+    CGFloat scaledDirection = scaleSpacingAndGlyphs * side;
 
     /*
      https://developer.mozilla.org/en/docs/Web/CSS/vertical-align
@@ -492,8 +687,8 @@ static double radToDeg = 180 / M_PI;
      */
     /*
     CGRect fontBounds = CTFontGetBoundingBox(fontRef);
-    double textHeight = CGRectGetHeight(textBounds);
-    double fontWidth = CGRectGetWidth(textBounds);
+    CGFloat textHeight = CGRectGetHeight(textBounds);
+    CGFloat fontWidth = CGRectGetWidth(textBounds);
     CGPoint fontOrigin = fontBounds.origin;
 
     CGFloat fontMinX = fontOrigin.x;
@@ -502,93 +697,93 @@ static double radToDeg = 180 / M_PI;
     CGFloat fontMaxY = fontMinY + textHeight;
     */
     // TODO
-    double descenderDepth = CTFontGetDescent(fontRef);
-    double bottom = descenderDepth + CTFontGetLeading(fontRef);
-    double ascenderHeight = CTFontGetAscent(fontRef);
-    double top = ascenderHeight;
-    double totalHeight = top + bottom;
-    double baselineShift = 0;
-    NSString *baselineShiftString = [self getBaselineShift];
-    enum AlignmentBaseline baseline = AlignmentBaselineFromString([self getAlignmentBaseline]);
-    if (baseline != AlignmentBaselineBaseline) {
+    CGFloat descenderDepth = CTFontGetDescent(fontRef);
+    CGFloat bottom = descenderDepth + CTFontGetLeading(fontRef);
+    CGFloat ascenderHeight = CTFontGetAscent(fontRef);
+    CGFloat top = ascenderHeight;
+    CGFloat totalHeight = top + bottom;
+    CGFloat baselineShift = 0;
+    NSString *baselineShiftString = self.baselineShift;
+    enum RNSVGAlignmentBaseline baseline = RNSVGAlignmentBaselineFromString(self.alignmentBaseline);
+    if (baseline != RNSVGAlignmentBaselineBaseline) {
         // TODO alignment-baseline, test / verify behavior
         // TODO get per glyph baselines from font baseline table, for high-precision alignment
         CGFloat xHeight = CTFontGetXHeight(fontRef);
         switch (baseline) {
                 // https://wiki.apache.org/xmlgraphics-fop/LineLayout/AlignmentHandling
             default:
-            case AlignmentBaselineBaseline:
+            case RNSVGAlignmentBaselineBaseline:
                 // Use the dominant baseline choice of the parent.
                 // Match the box’s corresponding baseline to that of its parent.
                 baselineShift = 0;
                 break;
 
-            case AlignmentBaselineTextBottom:
-            case AlignmentBaselineAfterEdge:
-            case AlignmentBaselineTextAfterEdge:
+            case RNSVGAlignmentBaselineTextBottom:
+            case RNSVGAlignmentBaselineAfterEdge:
+            case RNSVGAlignmentBaselineTextAfterEdge:
                 // Match the bottom of the box to the bottom of the parent’s content area.
                 // text-after-edge = text-bottom
                 // text-after-edge = descender depth
                 baselineShift = -descenderDepth;
                 break;
 
-            case AlignmentBaselineAlphabetic:
+            case RNSVGAlignmentBaselineAlphabetic:
                 // Match the box’s alphabetic baseline to that of its parent.
                 // alphabetic = 0
                 baselineShift = 0;
                 break;
 
-            case AlignmentBaselineIdeographic:
+            case RNSVGAlignmentBaselineIdeographic:
                 // Match the box’s ideographic character face under-side baseline to that of its parent.
                 // ideographic = descender depth
                 baselineShift = -descenderDepth;
                 break;
 
-            case AlignmentBaselineMiddle:
+            case RNSVGAlignmentBaselineMiddle:
                 // Align the vertical midpoint of the box with the baseline of the parent box plus half the x-height of the parent. TODO
                 // middle = x height / 2
                 baselineShift = xHeight / 2;
                 break;
 
-            case AlignmentBaselineCentral:
+            case RNSVGAlignmentBaselineCentral:
                 // Match the box’s central baseline to the central baseline of its parent.
                 // central = (ascender height - descender depth) / 2
                 baselineShift = (ascenderHeight - descenderDepth) / 2;
                 break;
 
-            case AlignmentBaselineMathematical:
+            case RNSVGAlignmentBaselineMathematical:
                 // Match the box’s mathematical baseline to that of its parent.
                 // Hanging and mathematical baselines
                 // There are no obvious formulas to calculate the position of these baselines.
                 // At the time of writing FOP puts the hanging baseline at 80% of the ascender
                 // height and the mathematical baseline at 50%.
-                baselineShift = 0.5 * ascenderHeight;
+                baselineShift = (CGFloat)0.5 * ascenderHeight;
                 break;
 
-            case AlignmentBaselineHanging:
-                baselineShift = 0.8 * ascenderHeight;
+            case RNSVGAlignmentBaselineHanging:
+                baselineShift = (CGFloat)0.8 * ascenderHeight;
                 break;
 
-            case AlignmentBaselineTextTop:
-            case AlignmentBaselineBeforeEdge:
-            case AlignmentBaselineTextBeforeEdge:
+            case RNSVGAlignmentBaselineTextTop:
+            case RNSVGAlignmentBaselineBeforeEdge:
+            case RNSVGAlignmentBaselineTextBeforeEdge:
                 // Match the top of the box to the top of the parent’s content area.
                 // text-before-edge = text-top
                 // text-before-edge = ascender height
                 baselineShift = ascenderHeight;
                 break;
 
-            case AlignmentBaselineBottom:
+            case RNSVGAlignmentBaselineBottom:
                 // Align the top of the aligned subtree with the top of the line box.
                 baselineShift = bottom;
                 break;
 
-            case AlignmentBaselineCenter:
+            case RNSVGAlignmentBaselineCenter:
                 // Align the center of the aligned subtree with the center of the line box.
                 baselineShift = totalHeight / 2;
                 break;
 
-            case AlignmentBaselineTop:
+            case RNSVGAlignmentBaselineTop:
                 // Align the bottom of the aligned subtree with the bottom of the line box.
                 baselineShift = top;
                 break;
@@ -624,8 +819,8 @@ static double radToDeg = 180 / M_PI;
      */
     if (baselineShiftString != nil && ![baselineShiftString isEqualToString:@""]) {
         switch (baseline) {
-            case AlignmentBaselineTop:
-            case AlignmentBaselineBottom:
+            case RNSVGAlignmentBaselineTop:
+            case RNSVGAlignmentBaselineBottom:
                 break;
 
             default:
@@ -636,7 +831,7 @@ static double radToDeg = 180 / M_PI;
                     NSDictionary* os2 = [tables objectForKey:@"os2"];
                     NSNumber* ySubscriptYOffset = [os2 objectForKey:@"ySubscriptYOffset"];
                     if (ySubscriptYOffset) {
-                        double subOffset = [ySubscriptYOffset doubleValue];
+                        CGFloat subOffset = (CGFloat)[ySubscriptYOffset doubleValue];
                         baselineShift += fontSize * subOffset / [unitsPerEm doubleValue];
                     }
                 } else if (fontData != nil && [baselineShiftString isEqualToString:@"super"]) {
@@ -646,26 +841,26 @@ static double radToDeg = 180 / M_PI;
                     NSDictionary* os2 = [tables objectForKey:@"os2"];
                     NSNumber* ySuperscriptYOffset = [os2 objectForKey:@"ySuperscriptYOffset"];
                     if (ySuperscriptYOffset) {
-                        double superOffset = [ySuperscriptYOffset doubleValue];
+                        CGFloat superOffset = (CGFloat)[ySuperscriptYOffset doubleValue];
                         baselineShift -= fontSize * superOffset / [unitsPerEm doubleValue];
                     }
                 } else if ([baselineShiftString isEqualToString:@"baseline"]) {
                 } else {
-                    baselineShift -= [PropHelper fromRelativeWithNSString:baselineShiftString
-                                                                 relative:fontSize
-                                                                   offset:0
-                                                                    scale:1
-                                                                 fontSize:fontSize];
-
+                    baselineShift -= [RNSVGPropHelper fromRelativeWithNSString:baselineShiftString
+                                                                   relative:fontSize
+                                                                   fontSize:fontSize];
                 }
                 break;
         }
     }
 
+    [emoji removeAllObjects];
+    [emojiTransform removeAllObjects];
+
     CFArrayRef runs = CTLineGetGlyphRuns(line);
     CFIndex runEnd = CFArrayGetCount(runs);
-    for (CFIndex r = 0; r < runEnd; r++) {
-        CTRunRef run = CFArrayGetValueAtIndex(runs, r);
+    for (CFIndex ri = 0; ri < runEnd; ri++) {
+        CTRunRef run = CFArrayGetValueAtIndex(runs, ri);
         CFIndex runGlyphCount = CTRunGetGlyphCount(run);
         CFIndex indices[runGlyphCount];
         CGSize advances[runGlyphCount];
@@ -676,6 +871,14 @@ static double radToDeg = 180 / M_PI;
         CTRunGetStringIndices(run, CFRangeMake(0, 0), indices);
         CTFontRef runFont = CFDictionaryGetValue(CTRunGetAttributes(run), kCTFontAttributeName);
         CTFontGetAdvancesForGlyphs(runFont, kCTFontOrientationHorizontal, glyphs, advances, runGlyphCount);
+        CFIndex nextOrEndRunIndex = n;
+        if (ri + 1 < runEnd) {
+            CTRunRef nextRun = CFArrayGetValueAtIndex(runs, ri + 1);
+            CFIndex nextRunGlyphCount = CTRunGetGlyphCount(nextRun);
+            CFIndex nextIndices[nextRunGlyphCount];
+            CTRunGetStringIndices(nextRun, CFRangeMake(0, 0), nextIndices);
+            nextOrEndRunIndex = nextIndices[0];
+        }
 
         for(CFIndex g = 0; g < runGlyphCount; g++) {
             CGGlyph glyph = glyphs[g];
@@ -683,11 +886,7 @@ static double radToDeg = 180 / M_PI;
             /*
              Determine the glyph's charwidth (i.e., the amount which the current text position
              advances horizontally when the glyph is drawn using horizontal text layout).
-             */
-            double unkernedAdvance = CTFontGetAdvancesForGlyphs(fontRef, kCTFontOrientationHorizontal, &glyph, NULL, 1);
-            CGFloat charWidth = unkernedAdvance * scaleSpacingAndGlyphs;
 
-            /*
              For each subsequent glyph, set a new startpoint-on-the-path as the previous
              endpoint-on-the-path, but with appropriate adjustments taking into account
              horizontal kerning tables in the font and current values of various attributes
@@ -696,25 +895,26 @@ static double radToDeg = 180 / M_PI;
              adjustments are calculated as distance adjustments along the path, calculated
              using the user agent's distance along the path algorithm.
              */
-            if (autoKerning) {
-                double kerned = advances[g].width * scaleSpacingAndGlyphs;
-                kerning = kerned - charWidth;
-            }
+            CGFloat charWidth = advances[g].width * scaleSpacingAndGlyphs;
 
             CFIndex currIndex = indices[g];
-            char currentChar = [str characterAtIndex:currIndex];
-            bool isWordSeparator = [separators characterIsMember:currentChar];
-            double wordSpace = isWordSeparator ? wordSpacing : 0;
-            double spacing = wordSpace + letterSpacing;
-            double advance = charWidth + spacing;
+            unichar currentChar = [str characterAtIndex:currIndex];
+            bool isWordSeparator = [RNSVGTSpan_separators characterIsMember:currentChar];
+            CGFloat wordSpace = isWordSeparator ? wordSpacing : 0;
+            CGFloat spacing = wordSpace + letterSpacing;
+            CGFloat advance = charWidth + spacing;
 
-            double x = [gc nextXWithDouble:kerning + advance];
-            double y = [gc nextY];
-            double dx = [gc nextDeltaX];
-            double dy = [gc nextDeltaY];
-            double r = [[gc nextRotation] doubleValue] / radToDeg;
+            CGFloat x = [gc nextXWithDouble:kerning + advance];
+            CGFloat y = [gc nextY];
+            CGFloat dx = [gc nextDeltaX];
+            CGFloat dy = [gc nextDeltaY];
+            CGFloat r = [gc nextRotation] / RNSVGTSpan_radToDeg;
 
-            CFIndex endIndex = g + 1 == runGlyphCount ? currIndex : indices[g + 1];
+            if (isWordSeparator) {
+                continue;
+            }
+
+            CFIndex endIndex = g + 1 == runGlyphCount ? nextOrEndRunIndex : indices[g + 1];
             while (++currIndex < endIndex) {
                 // Skip rendering other grapheme clusters of ligatures (already rendered),
                 // And, make sure to increment index positions by making gc.next() calls.
@@ -728,8 +928,8 @@ static double radToDeg = 180 / M_PI;
 
             advance *= side;
             charWidth *= side;
-            double cursor = offset + (x + dx) * side;
-            double startPoint = cursor - advance;
+            CGFloat cursor = offset + (x + dx) * side;
+            CGFloat startPoint = cursor - advance;
 
             CGAffineTransform transform = CGAffineTransformIdentity;
             if (hasTextPath) {
@@ -739,20 +939,22 @@ static double radToDeg = 180 / M_PI;
                  distance along the path algorithm. This point is the endpoint-on-the-path for
                  the glyph.
                  */
-                // TODO double endPoint = startPoint + charWidth;
+                // TODO CGFloat endPoint = startPoint + charWidth;
 
                 /*
                  Determine the midpoint-on-the-path, which is the point on the path which is
                  "halfway" (user agents can choose either a distance calculation or a parametric
                  calculation) between the startpoint-on-the-path and the endpoint-on-the-path.
                  */
-                double halfWay = charWidth / 2;
-                double midPoint = startPoint + halfWay;
+                CGFloat halfWay = charWidth / 2;
+                CGFloat midPoint = startPoint + halfWay;
 
                 //  Glyphs whose midpoint-on-the-path are off the path are not rendered.
                 if (midPoint > endOfRendering) {
+                    CGPathRelease(glyphPath);
                     continue;
                 } else if (midPoint < startOfRendering) {
+                    CGPathRelease(glyphPath);
                     continue;
                 }
 
@@ -773,8 +975,8 @@ static double radToDeg = 180 / M_PI;
                      return [obj1 compare:obj2];
                  }];
 
-                CGFloat totalLength = [lengths[i] doubleValue];
-                CGFloat prevLength = i == 0 ? 0 : [lengths[i - 1] doubleValue];
+                CGFloat totalLength = (CGFloat)[lengths[i] doubleValue];
+                CGFloat prevLength = i == 0 ? 0 : (CGFloat)[lengths[i - 1] doubleValue];
 
                 CGFloat length = totalLength - prevLength;
                 CGFloat percent = (midPoint - prevLength) / length;
@@ -799,8 +1001,40 @@ static double radToDeg = 180 / M_PI;
                 transform = CGAffineTransformConcat(CGAffineTransformMakeRotation(r), transform);
             }
 
-            transform = CGAffineTransformScale(transform, 1.0, -1.0);
-            CGPathAddPath(path, &transform, glyphPath);
+            CGRect box = CGPathGetBoundingBox(glyphPath);
+            CGFloat width = box.size.width;
+
+            if (width == 0) { // Render unicode emoji
+                UILabel *label = [[UILabel alloc] init];
+                CFIndex startIndex = indices[g];
+                long len = MAX(1, endIndex - startIndex);
+                NSRange range = NSMakeRange(startIndex, len);
+                NSString* currChars = [str substringWithRange:range];
+                label.text = currChars;
+                label.opaque = NO;
+                label.backgroundColor = UIColor.clearColor;
+                UIFont * customFont = [UIFont systemFontOfSize:fontSize];
+
+                CGSize measuredSize = [currChars sizeWithAttributes:
+                                       @{NSFontAttributeName:customFont}];
+                label.font = customFont;
+                CGFloat width = ceil(measuredSize.width);
+                CGFloat height = ceil(measuredSize.height);
+                CGRect bounds = CGRectMake(0, 0, width, height);
+                label.frame = bounds;
+
+                CGContextConcatCTM(context, transform);
+                CGContextTranslateCTM(context, 0, -fontSize);
+                [label.layer renderInContext:context];
+                CGContextTranslateCTM(context, 0, fontSize);
+                CGContextConcatCTM(context, CGAffineTransformInvert(transform));
+
+                [emoji addObject:label];
+                [emojiTransform addObject:[NSValue valueWithCGAffineTransform:transform]];
+            } else {
+                transform = CGAffineTransformScale(transform, 1.0, -1.0);
+                CGPathAddPath(path, &transform, glyphPath);
+            }
             CGPathRelease(glyphPath);
         }
     }
@@ -808,17 +1042,17 @@ static double radToDeg = 180 / M_PI;
     CFRelease(attrString);
     CFRelease(line);
 
-    return path;
+    return (CGPathRef)CFAutorelease(path);
 }
 
-CGFloat getTextAnchorOffset(enum TextAnchor textAnchor, CGFloat width)
++ (CGFloat)getTextAnchorOffset:(RNSVGTextAnchor)textAnchor width:(CGFloat) width
 {
     switch (textAnchor) {
-        case TextAnchorStart:
+        case RNSVGTextAnchorStart:
             return 0;
-        case TextAnchorMiddle:
+        case RNSVGTextAnchorMiddle:
             return -width / 2;
-        case TextAnchorEnd:
+        case RNSVGTextAnchorEnd:
             return -width;
     }
 
@@ -830,29 +1064,22 @@ CGFloat getTextAnchorOffset(enum TextAnchor textAnchor, CGFloat width)
     lines = nil;
     lengths = nil;
     textPath = nil;
-    [self traverseTextSuperviews:^(__kindof RNSVGText *node) {
-        if ([node class] == [RNSVGTextPath class]) {
-            textPath = (RNSVGTextPath*) node;
-            [textPath getPathLength:&_pathLength lineCount:&lineCount lengths:&lengths lines:&lines isClosed:&isClosed];
-            return NO;
-        }
-        return YES;
-    }];
-}
+    RNSVGText *parent = (RNSVGText*)[self superview];
 
-- (void)traverseTextSuperviews:(BOOL (^)(__kindof RNSVGText *node))block
-{
-    RNSVGText *targetView = self;
-    BOOL result = block(self);
-
-    while (targetView && [targetView class] != [RNSVGText class] && result) {
-        if (![targetView isKindOfClass:[RNSVGText class]]) {
-            //todo: throw exception here
+    while (parent) {
+        if ([parent class] == [RNSVGTextPath class]) {
+            textPath = (RNSVGTextPath*) parent;
+            [textPath getPathLength:&_pathLength
+                          lineCount:&lineCount
+                            lengths:&lengths
+                              lines:&lines
+                           isClosed:&isClosed];
+            break;
+        } else if (![parent isKindOfClass:[RNSVGText class]]) {
             break;
         }
 
-        targetView = (RNSVGText*)[targetView superview];
-        result = block(targetView);
+        parent = (RNSVGText*)[parent superview];
     }
 }
 
